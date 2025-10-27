@@ -13,11 +13,16 @@ pub struct LoginArgs {
     #[arg(long_help = "The registry to login. Supported registries: universe (GitHub).")]
     /// The registry to login (universe)
     pub registry: String,
+
+    #[arg(long, default_value = "pat")]
+    #[arg(long_help = "Login method: 'pat' for Personal Access Token, 'device' for GitHub device authorization.")]
+    /// Login method (pat or device)
+    pub method: String,
 }
 
 pub fn login(args: &LoginArgs) -> Result<()> {
     match args.registry.as_str() {
-        "universe" => universe::login(),
+        "universe" => universe::login(&args.method),
         _ => {
             anyhow::bail!("Unsupported registry: {}", args.registry);
         }

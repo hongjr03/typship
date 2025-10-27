@@ -13,10 +13,95 @@ use octocrab::models::pulls::PullRequest;
 use octocrab::models::repos::{ContentItems, Object};
 use octocrab::{params, Octocrab, Page};
 use regex::Regex;
+use reqwest::Client;
 use secrecy::SecretString;
+use serde::Deserialize;
 use std::process::Command;
 use tempfile::TempDir;
+use tokio::time::{sleep, Duration};
 use typst_syntax::package::{PackageManifest, PackageVersion};
+
+#[derive(Deserialize)]
+struct DeviceCodeResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    expires_in: u64,
+    interval: u64,
+}
+
+#[derive(Deserialize)]
+struct TokenResponse {
+    access_token: String,
+}
+
+pub fn login_device() -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(login_device_async())
+}
+
+async fn login_device_async() -> Result<()> {
+    // Note: This client_id is for demonstration. In production, use Typst's official OAuth App client_id
+    let client_id = "178c6fc778ccc68e1d6a"; // GitHub CLI's client_id as example
+
+    let client = Client::new();
+
+    // Step 1: Request device code
+    let response: DeviceCodeResponse = client
+        .post("https://github.com/login/device/code")
+        .header("Accept", "application/json")
+        .form(&[("client_id", client_id), ("scope", "repo")])
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    println!("Please visit {} and enter the code: {}", response.verification_uri, response.user_code);
+
+    // Open browser
+    if cfg!(target_os = "macos") {
+        Command::new("open").arg(&response.verification_uri).spawn()?;
+    } else if cfg!(target_os = "linux") {
+        Command::new("xdg-open").arg(&response.verification_uri).spawn()?;
+    } else if cfg!(target_os = "windows") {
+        Command::new("cmd").args(&["/C", "start", &response.verification_uri]).spawn()?;
+    }
+
+    // Step 2: Poll for token
+    let mut attempts = 0;
+    let max_attempts = response.expires_in / response.interval;
+
+    while attempts < max_attempts {
+        sleep(Duration::from_secs(response.interval)).await;
+
+        let token_response = client
+            .post("https://github.com/login/oauth/access_token")
+            .header("Accept", "application/json")
+            .form(&[
+                ("client_id", client_id),
+                ("device_code", &response.device_code),
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ])
+            .send()
+            .await?;
+
+        if token_response.status().is_success() {
+            let token: TokenResponse = token_response.json().await?;
+            CONFIG.try_lock()?.tokens.universe = Some(token.access_token);
+            if let Ok(cfg) = CONFIG.try_lock() {
+                save_config(&cfg)?;
+            } else {
+                bail!("Failed to save the configuration file");
+            }
+            info!("Successfully logged in using device authorization!");
+            return Ok(());
+        }
+
+        attempts += 1;
+    }
+
+    bail!("Device authorization timed out. Please try again.");
+}
 
 use crate::config::CONFIG;
 use crate::utils::walkers::walker_publish;
@@ -83,7 +168,15 @@ pub async fn pending_list() -> Result<Page<PullRequest>> {
         .await?)
 }
 
-pub fn login() -> Result<()> {
+pub fn login(method: &str) -> Result<()> {
+    match method {
+        "pat" => login_pat(),
+        "device" => login_device(),
+        _ => anyhow::bail!("Unsupported login method: {}", method),
+    }
+}
+
+pub fn login_pat() -> Result<()> {
     let overwrite = if CONFIG.try_lock()?.tokens.universe.is_some() {
         info!("Already logged in to the Universe registry");
         dialoguer::Confirm::new()
